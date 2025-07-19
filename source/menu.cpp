@@ -809,7 +809,7 @@ static void WindowCredits(void * ptr)
 
 	txt[i] = new GuiText("Main developer");
 	txt[i]->SetPosition(40,y); i++;
-	txt[i] = new GuiText("Tantric");
+	txt[i] = new GuiText("Tantric, YoshiDeLana2025");
 	txt[i]->SetPosition(250,y); i++; y+=48;
 
 	txt[i] = new GuiText("Additional coding");
