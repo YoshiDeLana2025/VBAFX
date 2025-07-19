@@ -19,7 +19,7 @@ export	FREETYPE_LIBS	:=	`$(DEVKITPRO)/portlibs/ppc/bin/powerpc-eabi-pkg-config -
 # SOURCES is a list of directories containing source code
 # INCLUDES is a list of directories containing extra header files
 #---------------------------------------------------------------------------------
-TARGET		:=	vbagx-gc
+TARGET		:=	vbafx-gc
 TARGETDIR   :=  executables
 BUILD		:=	build_gc
 SOURCES		:=	source source/gui source/utils source/utils/sz \
