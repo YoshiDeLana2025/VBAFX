@@ -16,9 +16,9 @@
 #include "filelist.h"
 #include "utils/FreeTypeGX.h"
 
-#define APPNAME 		"Visual Boy Advance GX"
+#define APPNAME 		"Visual Boy Advance FX"
 #define APPVERSION 		"2.4.9"
-#define APPFOLDER 		"vbagx"
+#define APPFOLDER 		"vbafx"
 #define PREF_FILE_NAME 	"settings.xml"
 #define PAL_FILE_NAME 	"palettes.xml"
 
