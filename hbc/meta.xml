@@ -5,6 +5,6 @@
   <version>2.4.9</version>
   <release_date>20250719</release_date>
   <short_description>GBA/GBC/GB Emulator</short_description>
-  <long_description>Visual Boy Advance FX is a fork of Visual Boy Advance GC on Wii.</long_description>
+  <long_description>Visual Boy Advance FX is a fork of Visual Boy Advance GX on Wii.</long_description>
   <ahb_access />
 </app>
