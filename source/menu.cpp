@@ -10,6 +10,7 @@
 
 #include <gccore.h>
 #include <ogcsys.h>
+#include <ogc/cond.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,8 +76,20 @@ static int mapMenuCtrl = 0;
 
 static lwp_t guithread = LWP_THREAD_NULL;
 static lwp_t progressthread = LWP_THREAD_NULL;
-static bool guiHalt = true;
-static int showProgress = 0;
+static volatile bool guiHalt = true;
+static volatile int showProgress = 0;
+
+// GUI thread synchronization
+static mutex_t guiMutex    = LWP_MUTEX_NULL;
+static cond_t  guiHaltCond = LWP_COND_NULL; // GUI thread -> main: halted
+static cond_t  guiWakeCond = LWP_COND_NULL; // main -> GUI thread: resume
+static bool    guiHalted   = false;          // protected by guiMutex
+
+// progress thread synchronization
+static mutex_t progMutex      = LWP_MUTEX_NULL;
+static cond_t  progActiveCond = LWP_COND_NULL; // main -> progress: work available
+static cond_t  progIdleCond   = LWP_COND_NULL; // progress -> main: now idle
+static bool    progIdle       = true;           // protected by progMutex
 
 static char progressTitle[101];
 static char progressMsg[201];
@@ -96,8 +109,10 @@ u32 bg_music_size;
 static void
 ResumeGui()
 {
+	LWP_MutexLock(guiMutex);
 	guiHalt = false;
-	LWP_ResumeThread (guithread);
+	LWP_CondSignal(guiWakeCond);
+	LWP_MutexUnlock(guiMutex);
 }
 
 /****************************************************************************
@@ -111,11 +126,11 @@ ResumeGui()
 static void
 HaltGui()
 {
+	LWP_MutexLock(guiMutex);
 	guiHalt = true;
-
-	// wait for thread to finish
-	while(!LWP_ThreadIsSuspended(guithread))
-		usleep(THREAD_SLEEP);
+	while(!guiHalted)
+		LWP_CondWait(guiHaltCond, guiMutex);
+	LWP_MutexUnlock(guiMutex);
 }
 
 static void ResetText()
@@ -323,8 +338,17 @@ UpdateGUI (void *arg)
 
 	while(1)
 	{
+		// if halted, block here until ResumeGui wakes us; signal HaltGui we have stopped
+		LWP_MutexLock(guiMutex);
 		if(guiHalt)
-			LWP_SuspendThread(guithread);
+		{
+			guiHalted = true;
+			LWP_CondBroadcast(guiHaltCond);
+			while(guiHalt)
+				LWP_CondWait(guiWakeCond, guiMutex);
+			guiHalted = false;
+		}
+		LWP_MutexUnlock(guiMutex);
 
 		UpdatePads();
 		mainWindow->Draw();
@@ -373,8 +397,6 @@ UpdateGUI (void *arg)
  * progress bar showing % completion, or a throbber that only shows that an
  * action is in progress.
  ***************************************************************************/
-static int progsleep = 0;
-
 static void
 ProgressWindow(char *title, char *msg)
 {
@@ -433,7 +455,7 @@ ProgressWindow(char *title, char *msg)
 	}
 
 	// wait to see if progress flag changes soon
-	progsleep = 800000;
+	int progsleep = 800000;
 
 	while(progsleep > 0)
 	{
@@ -458,7 +480,7 @@ ProgressWindow(char *title, char *msg)
 
 	while(showProgress)
 	{
-		progsleep = 20000;
+		int progsleep = 20000;
 
 		while(progsleep > 0)
 		{
@@ -493,13 +515,20 @@ ProgressWindow(char *title, char *msg)
 
 static void * ProgressThread (void *arg)
 {
+	LWP_MutexLock(progMutex);
 	while(1)
 	{
-		if(!showProgress)
-			LWP_SuspendThread (progressthread);
+		// sleep until ShowProgress/ShowAction signals there is work to do
+		while(!showProgress)
+			LWP_CondWait(progActiveCond, progMutex);
+		progIdle = false;
+		LWP_MutexUnlock(progMutex);
 
 		ProgressWindow(progressTitle, progressMsg);
-		usleep(THREAD_SLEEP);
+
+		LWP_MutexLock(progMutex);
+		progIdle = true;
+		LWP_CondBroadcast(progIdleCond); // wake CancelAction callers
 	}
 	return NULL;
 }
@@ -512,8 +541,16 @@ static void * ProgressThread (void *arg)
 void
 InitGUIThreads()
 {
-	LWP_CreateThread (&guithread, UpdateGUI, NULL, NULL, 0, 70);
-	LWP_CreateThread (&progressthread, ProgressThread, NULL, NULL, 0, 40);
+	LWP_MutexInit(&guiMutex, false);
+	LWP_CondInit(&guiHaltCond);
+	LWP_CondInit(&guiWakeCond);
+
+	LWP_MutexInit(&progMutex, false);
+	LWP_CondInit(&progActiveCond);
+	LWP_CondInit(&progIdleCond);
+
+	LWP_CreateThread(&guithread, UpdateGUI, NULL, NULL, 24576, 70);
+	LWP_CreateThread(&progressthread, ProgressThread, NULL, NULL, 0, 40);
 }
 
 /****************************************************************************
@@ -526,11 +563,11 @@ InitGUIThreads()
 void
 CancelAction()
 {
+	LWP_MutexLock(progMutex);
 	showProgress = 0;
-
-	// wait for thread to finish
-	while(!LWP_ThreadIsSuspended(progressthread))
-		usleep(THREAD_SLEEP);
+	while(!progIdle)
+		LWP_CondWait(progIdleCond, progMutex);
+	LWP_MutexUnlock(progMutex);
 }
 
 /****************************************************************************
@@ -547,19 +584,23 @@ ShowProgress (const char *msg, int done, int total)
 
 	if(total < (256*1024))
 		return;
+	else if(done > total) // this shouldn't happen
+		done = total;
 
-	if(done > total) // this shouldn't happen
+	if(done/total > 0.99)
 		done = total;
 
 	if(showProgress != 1)
 		CancelAction(); // wait for previous progress window to finish
 
+	LWP_MutexLock(progMutex);
 	snprintf(progressMsg, 200, "%s", msg);
 	sprintf(progressTitle, "Please Wait");
 	showProgress = 1;
 	progressTotal = total;
 	progressDone = done;
-	LWP_ResumeThread (progressthread);
+	LWP_CondSignal(progActiveCond);
+	LWP_MutexUnlock(progMutex);
 }
 
 /****************************************************************************
@@ -577,12 +618,14 @@ ShowAction (const char *msg)
 	if(showProgress != 0)
 		CancelAction(); // wait for previous progress window to finish
 
+	LWP_MutexLock(progMutex);
 	snprintf(progressMsg, 200, "%s", msg);
 	sprintf(progressTitle, "Please Wait");
 	showProgress = 2;
 	progressDone = 0;
 	progressTotal = 0;
-	LWP_ResumeThread (progressthread);
+	LWP_CondSignal(progActiveCond);
+	LWP_MutexUnlock(progMutex);
 }
 
 void ErrorPrompt(const char *msg)
@@ -936,9 +979,10 @@ static char* getImageFolder()
 {
 	switch(GCSettings.PreviewImage)
 	{
-		case 1 : return GCSettings.CoverFolder; break;
-		case 2 : return GCSettings.ArtworkFolder; break;
-		default: return GCSettings.ScreenshotsFolder; break;
+		case PREVIEWIMAGE_SCREENSHOT : return GCSettings.ScreenshotsFolder;
+		case PREVIEWIMAGE_COVER : return GCSettings.CoverFolder;
+		case PREVIEWIMAGE_ARTWORK : return GCSettings.ArtworkFolder;
+		default : return GCSettings.CoverFolder;
 	}
 }
 
@@ -1014,10 +1058,7 @@ static int MenuGameSelection()
 	trigPlusMinus.SetButtonOnlyTrigger(-1, WPAD_BUTTON_PLUS | WPAD_CLASSIC_BUTTON_PLUS, PAD_TRIGGER_Z, WIIDRC_BUTTON_PLUS);
 
 	GuiImage bgPreview(&bgPreviewImg);
-	GuiButton bgPreviewBtn(bgPreview.GetWidth(), bgPreview.GetHeight());
-	bgPreviewBtn.SetImage(&bgPreview);
-	bgPreviewBtn.SetPosition(365, 98);
-	bgPreviewBtn.SetTrigger(&trigPlusMinus);
+	bgPreview.SetPosition(365, 98);
 	int previousPreviewImg = GCSettings.PreviewImage;
 	
 	GuiImage preview;
@@ -1033,7 +1074,7 @@ static int MenuGameSelection()
 	mainWindow->Append(&titleTxt);
 	mainWindow->Append(&gameBrowser);
 	mainWindow->Append(&buttonWindow);
-	mainWindow->Append(&bgPreviewBtn);
+	mainWindow->Append(&bgPreview);
 	mainWindow->Append(&preview);
 	ResumeGui();
 
@@ -1097,7 +1138,6 @@ static int MenuGameSelection()
 					ShutoffRumble();
 					#endif
 					mainWindow->SetState(STATE_DISABLED);
-					SavePrefs(SILENT);
 					if(BrowserLoadFile())
 						menu = MENU_EXIT;
 					else
@@ -1111,17 +1151,26 @@ static int MenuGameSelection()
 		{
 			previousBrowserIndex = browser.selIndex;
 			previousPreviewImg = GCSettings.PreviewImage;
-			snprintf(imagePath, MAXJOLIET, "%s%s/%s.png", pathPrefix[GCSettings.LoadMethod], getImageFolder(), browserList[browser.selIndex].displayname);
 
-			int width, height;
-			if(DecodePNGFromFile(imagePath, &width, &height, imgBuffer, 640, 480))
+			// ensure selected index is valid
+			if(browser.dir[0] == 0 || GCSettings.LoadMethod <= 0 || browser.numEntries <= 0 || browser.selIndex <= 0 || browser.selIndex >= browser.numEntries)
 			{
-				preview.SetImage(imgBuffer, width, height);
-				preview.SetScale( MIN(225.0f / width, 235.0f / height) );
+				preview.SetImage(NULL, 0, 0);
 			}
 			else
 			{
-				preview.SetImage(NULL, 0, 0);
+				snprintf(imagePath, MAXJOLIET, "%s%s/%s.png", pathPrefix[GCSettings.LoadMethod], getImageFolder(), browserList[browser.selIndex].displayname);
+
+				int width, height;
+				if(ChangeInterface(imagePath, SILENT) && DecodePNGFromFile(imagePath, &width, &height, imgBuffer, 640, 480))
+				{
+					preview.SetImage(imgBuffer, width, height);
+					preview.SetScale( MIN(225.0f / width, 235.0f / height) );
+				}
+				else
+				{
+					preview.SetImage(NULL, 0, 0);
+				}
 			}
 		}
 
@@ -1129,11 +1178,6 @@ static int MenuGameSelection()
 			menu = MENU_SETTINGS;
 		else if(exitBtn.GetState() == STATE_CLICKED)
 			ExitRequested = 1;
-		else if(bgPreviewBtn.GetState() == STATE_CLICKED)
-		{
-			GCSettings.PreviewImage = (GCSettings.PreviewImage + 1) % 3;
-			bgPreviewBtn.ResetState();
-		}
 	}
 
 	HaltParseThread(); // halt parsing
@@ -1142,7 +1186,7 @@ static int MenuGameSelection()
 	mainWindow->Remove(&titleTxt);
 	mainWindow->Remove(&buttonWindow);
 	mainWindow->Remove(&gameBrowser);
-	mainWindow->Remove(&bgPreviewBtn);
+	mainWindow->Remove(&bgPreview);
 	mainWindow->Remove(&preview);
 	MEM_DEALLOC(imgBuffer);
 	return menu;
@@ -1769,9 +1813,6 @@ static int MenuGameSaves(int action)
 
 	int method = GCSettings.SaveMethod;
 
-	if(method == DEVICE_AUTO)
-		autoSaveMethod(NOTSILENT);
-
 	if(!ChangeInterface(method, NOTSILENT))
 		return MENU_GAME;
 
@@ -2226,7 +2267,7 @@ static int MenuGameSettings()
 		{
 			if (WindowPrompt("Preview Screenshot", "Save a new Preview Screenshot? Current Screenshot image will be overwritten.", "OK", "Cancel"))
 			{
-				snprintf(filepath, 1024, "%s%s/%s", pathPrefix[GCSettings.SaveMethod], GCSettings.ScreenshotsFolder, ROMFilename);
+				snprintf(filepath, 1024, "%s%s/%s", pathPrefix[GCSettings.LoadMethod], GCSettings.ScreenshotsFolder, ROMFilename);
 				SavePreviewImg(filepath, SILENT); 
 			}
 		}
@@ -3157,18 +3198,18 @@ static int MenuSettingsVideo()
 		{
 			case 0:
 				GCSettings.render++;
-				if (GCSettings.render > 4)
-					GCSettings.render = 1;
+				if (GCSettings.render >= RENDER_LENGTH)
+					GCSettings.render = RENDER_FILTERED;
 				break;
 
 			case 1:
 				GCSettings.scaling++;
-				if (GCSettings.scaling > 3)
-					GCSettings.scaling = 0;
+				if (GCSettings.scaling >= SCALING_LENGTH)
+					GCSettings.scaling = SCALING_MAINTAIN_ASPECT;
 				// disable Widescreen correction in Wii mode - determined automatically
 				#ifdef HW_RVL
-				if(GCSettings.scaling == 3)
-					GCSettings.scaling = 0;
+				if(GCSettings.scaling == SCALING_WIDESCREEN_CORRECTION)
+					GCSettings.scaling = SCALING_MAINTAIN_ASPECT;
 				#endif
 				break;
 
@@ -3194,8 +3235,8 @@ static int MenuSettingsVideo()
 
 			case 5:
 				GCSettings.videomode++;
-				if(GCSettings.videomode > 6)
-					GCSettings.videomode = 0;
+				if(GCSettings.videomode >= VIDEOMODE_LENGTH)
+					GCSettings.videomode = VIDEOMODE_AUTO;
 				break;
 
 			case 6:
@@ -3218,24 +3259,22 @@ static int MenuSettingsVideo()
 		{
 			firstRun = false;
 
-			if (GCSettings.render == 0)
-				sprintf (options.value[0], "Original");
-			else if (GCSettings.render == 1)
+			if (GCSettings.render == RENDER_FILTERED)
 				sprintf (options.value[0], "Filtered (Auto)");
-			else if (GCSettings.render == 2)
+			else if (GCSettings.render == RENDER_UNFILTERED)
 				sprintf (options.value[0], "Unfiltered");
-			else if (GCSettings.render == 3)
+			else if (GCSettings.render == RENDER_FILTERED_SHARP)
 				sprintf (options.value[0], "Filtered (Sharp)");
-			else if (GCSettings.render == 4)
+			else if (GCSettings.render == RENDER_FILTERED_SOFT)
 				sprintf (options.value[0], "Filtered (Soft)");
 
-			if (GCSettings.scaling == 0)
+			if (GCSettings.scaling == SCALING_MAINTAIN_ASPECT)
 				sprintf (options.value[1], "Maintain Aspect Ratio");
-			else if (GCSettings.scaling == 1)
+			else if (GCSettings.scaling == SCALING_PARTIAL_STRETCH)
 				sprintf (options.value[1], "Partial Stretch");
-			else if (GCSettings.scaling == 2)
+			else if (GCSettings.scaling == SCALING_STRETCH_TO_FIT)
 				sprintf (options.value[1], "Stretch to Fit");
-			else if (GCSettings.scaling == 3)
+			else if (GCSettings.scaling == SCALING_WIDESCREEN_CORRECTION)
 				sprintf (options.value[1], "16:9 Correction");
 
 			int fixed;
@@ -3263,19 +3302,19 @@ static int MenuSettingsVideo()
 
 			switch(GCSettings.videomode)
 			{
-				case 0:
+				case VIDEOMODE_AUTO:
 					sprintf (options.value[5], "Automatic (Recommended)"); break;
-				case 1:
+				case VIDEOMODE_NTSC:
 					sprintf (options.value[5], "NTSC (480i)"); break;
-				case 2:
+				case VIDEOMODE_PROGRESSIVE:
 					sprintf (options.value[5], "NTSC (480p)"); break;
-				case 3:
+				case VIDEOMODE_PAL:
 					sprintf (options.value[5], "PAL (576i)"); break;
-				case 4:
+				case VIDEOMODE_EURGB:
 					sprintf (options.value[5], "European RGB (240i)"); break;
-				case 5:
+				case VIDEOMODE_240P:
 					sprintf (options.value[5], "NTSC (240p)"); break;
-				case 6:
+				case VIDEOMODE_EURGB_240P:
 					sprintf (options.value[5], "European RGB (240p)"); break;
 			}
 
@@ -3618,8 +3657,11 @@ static int MenuSettings()
 				"Yes",
 				"No");
 
-			if(choice == 1)
+			if(choice == 1) {
 				DefaultSettings();
+				autoSaveMethod(SILENT);
+				autoLoadMethod(SILENT);
+			}
 		}
 	}
 
@@ -3769,7 +3811,7 @@ static int MenuSettingsFile()
 			if(GCSettings.SaveMethod == DEVICE_DVD)
 				GCSettings.SaveMethod++;
 
-			// don't allow SD Gecko on Wii
+			// skip GameCube devices on Wii
 			#ifdef HW_RVL
 			if(GCSettings.LoadMethod == DEVICE_SD_SLOTA)
 				GCSettings.LoadMethod++;
@@ -3783,13 +3825,17 @@ static int MenuSettingsFile()
 				GCSettings.LoadMethod++;
 			if(GCSettings.SaveMethod == DEVICE_SD_PORT2)
 				GCSettings.SaveMethod++;
+			if(GCSettings.LoadMethod == DEVICE_SD_GCLOADER)
+				GCSettings.LoadMethod++;
+			if(GCSettings.SaveMethod == DEVICE_SD_GCLOADER)
+				GCSettings.SaveMethod++;
 			#endif
 
 			// correct load/save methods out of bounds
-			if(GCSettings.LoadMethod > 8)
-				GCSettings.LoadMethod = 0;
-			if(GCSettings.SaveMethod > 8)
-				GCSettings.SaveMethod = 0;
+			if(GCSettings.LoadMethod >= DEVICE_LENGTH)
+				GCSettings.LoadMethod = DEVICE_AUTO;
+			if(GCSettings.SaveMethod >= DEVICE_LENGTH)
+				GCSettings.SaveMethod = DEVICE_AUTO;
 
 			if (GCSettings.LoadMethod == DEVICE_AUTO) sprintf (options.value[0],"Auto Detect");
 			else if (GCSettings.LoadMethod == DEVICE_SD) sprintf (options.value[0],"SD");
@@ -3834,6 +3880,8 @@ static int MenuSettingsFile()
 		if(backBtn.GetState() == STATE_CLICKED)
 		{
 			menu = MENU_SETTINGS;
+			autoSaveMethod(SILENT);
+			autoLoadMethod(SILENT);
 		}
 	}
 	HaltGui();
@@ -3914,8 +3962,13 @@ static int MenuSettingsMenu()
 		{
 			case 0:
 				GCSettings.ExitAction++;
-				if(GCSettings.ExitAction > 3)
-					GCSettings.ExitAction = 0;
+				#ifdef HW_RVL
+				if(GCSettings.ExitAction >= EXITACTION_WII_LENGTH)
+					GCSettings.ExitAction = EXITACTION_WII_AUTO;
+				#else
+				if(GCSettings.ExitAction >= EXITACTION_GC_LENGTH)
+					GCSettings.ExitAction = EXITACTION_GC_RETURN_TO_LOADER;
+				#endif
 				break;
 			case 1:
 				GCSettings.WiimoteOrientation ^= 1;
@@ -3944,8 +3997,8 @@ static int MenuSettingsMenu()
 				break;			
 			case 6:
 				GCSettings.PreviewImage++;
-				if(GCSettings.PreviewImage > 2)
-					GCSettings.PreviewImage = 0;
+				if(GCSettings.PreviewImage >= PREVIEWIMAGE_LENGTH)
+					GCSettings.PreviewImage = PREVIEWIMAGE_SCREENSHOT;
 				break;
 		}
 
@@ -3954,18 +4007,16 @@ static int MenuSettingsMenu()
 			firstRun = false;
 
 			#ifdef HW_RVL
-			if (GCSettings.ExitAction == 1)
+			if (GCSettings.ExitAction == EXITACTION_WII_RETURN_TO_MENU)
 				sprintf (options.value[0], "Return to Wii Menu");
-			else if (GCSettings.ExitAction == 2)
+			else if (GCSettings.ExitAction == EXITACTION_WII_POWER_OFF)
 				sprintf (options.value[0], "Power off Wii");
-			else if (GCSettings.ExitAction == 3)
+			else if (GCSettings.ExitAction == EXITACTION_WII_RETURN_TO_LOADER)
 				sprintf (options.value[0], "Return to Loader");
 			else
 				sprintf (options.value[0], "Auto");
 			#else // GameCube
-			if(GCSettings.ExitAction > 1)
-				GCSettings.ExitAction = 0;
-			if (GCSettings.ExitAction == 0)
+			if (GCSettings.ExitAction == EXITACTION_GC_RETURN_TO_LOADER)
 				sprintf (options.value[0], "Return to Loader");
 			else
 				sprintf (options.value[0], "Reboot");
@@ -3976,9 +4027,9 @@ static int MenuSettingsMenu()
 			options.name[4][0] = 0; // Rumble
 			#endif
 
-			if (GCSettings.WiimoteOrientation == 0)
+			if (GCSettings.WiimoteOrientation == WIIMOTEORIENTATION_VERTICAL)
 				sprintf (options.value[1], "Vertical");
-			else if (GCSettings.WiimoteOrientation == 1)
+			else if (GCSettings.WiimoteOrientation == WIIMOTEORIENTATION_HORIZONTAL)
 				sprintf (options.value[1], "Horizontal");
 
 			if(GCSettings.MusicVolume > 0)
@@ -4923,9 +4974,12 @@ MainMenu (int menu)
 		ResumeGui();
 
 	if(firstRun) {
-		// Load preferences
-		if(!LoadPrefs())
-			SavePrefs(SILENT);
+		LoadPrefs();
+		autoSaveMethod(SILENT);
+		autoLoadMethod(SILENT);
+
+		CreateMissingDirectories();
+		SavePrefs(SILENT);
 	}
 
 #ifdef HW_RVL

@@ -91,24 +91,24 @@ void ExitApp()
 
 	ExitCleanup();
 
+#ifdef HW_RVL
 	if(ShutdownRequested) {
-		SYS_ResetSystem(SYS_POWEROFF_STANDBY, 0, 0);
+		SYS_ResetSystem(SYS_POWEROFF_STANDBY, 0, FALSE);
 	}
 	else if(GCSettings.AutoloadGame) {
 		if( !!*(u32*)0x80001800 )
 		{
-			// Were we launched via HBC? (or via wiiflows stub replacement? :P)
+			// Were we launched via HBC? (or via WiiFlow's stub replacement)
 			exit(1);
 		}
 		else
 		{
 			// Wii channel support
-			SYS_ResetSystem( SYS_RETURNTOMENU, 0, 0 );
+			SYS_ResetSystem(SYS_RETURNTOMENU, 0, FALSE);
 		}
 	}
 	else {
-		#ifdef HW_RVL
-		if(GCSettings.ExitAction == 0) // Auto
+		if(GCSettings.ExitAction == EXITACTION_WII_AUTO) // Auto
 		{
 			char * sig = (char *)0x80001804;
 			if(
@@ -120,35 +120,37 @@ void ExitApp()
 				sig[5] == 'A' &&
 				sig[6] == 'X' &&
 				sig[7] == 'X')
-				GCSettings.ExitAction = 3; // Exit to HBC
+				GCSettings.ExitAction = EXITACTION_WII_RETURN_TO_LOADER; // Exit to HBC
 			else
-				GCSettings.ExitAction = 1; // HBC not found
+				GCSettings.ExitAction = EXITACTION_WII_RETURN_TO_MENU; // HBC not found
 		}
-		#endif
 
-		if(GCSettings.ExitAction == 1) // Exit to Menu
+		if(GCSettings.ExitAction == EXITACTION_WII_RETURN_TO_MENU) // Exit to Menu
 		{
-			#ifdef HW_RVL
-				SYS_ResetSystem(SYS_RETURNTOMENU, 0, 0);
-			#else
-				#define SOFTRESET_ADR ((volatile u32*)0xCC003024)
-				*SOFTRESET_ADR = 0x00000000;
-			#endif
+			SYS_ResetSystem(SYS_RETURNTOMENU, 0, FALSE);
 		}
-		else if(GCSettings.ExitAction == 2) // Shutdown Wii
+		else if(GCSettings.ExitAction == EXITACTION_WII_POWER_OFF) // Shutdown Wii
 		{
-			SYS_ResetSystem(SYS_POWEROFF_STANDBY, 0, 0);
+			SYS_ResetSystem(SYS_POWEROFF_STANDBY, 0, FALSE);
 		}
 		else // Exit to Loader
 		{
-			#ifdef HW_RVL
-				exit(0);
-			#else
-				if (psoid[0] == PSOSDLOADID)
-					PSOReload();
-			#endif
+			exit(0);
 		}
 	}
+#else
+	if(GCSettings.ExitAction == EXITACTION_GC_REBOOT) // Reboot
+	{
+		SYS_ResetSystem(SYS_RETURNTOMENU, 0, FALSE);
+	}
+	else // Exit to Loader
+	{
+		if (psoid[0] == PSOSDLOADID)
+			PSOReload();
+		else
+			exit(0);
+	}
+#endif
 }
 
 #ifdef HW_RVL
@@ -394,14 +396,16 @@ int main(int argc, char *argv[])
 	InitGUIThreads();
 
 	bool autoboot = false;
+
+#ifdef HW_RVL
 	if(argc > 2 && argv[1] != NULL && argv[2] != NULL) {
 		LoadPrefs();
-		if(strcasestr(argv[1], "sd:/") != NULL)
+		if(strncmp(argv[1], "sd", 2) == 0)
 		{
 			GCSettings.SaveMethod = DEVICE_SD;
 			GCSettings.LoadMethod = DEVICE_SD;
 		}
-		else
+		else if(strncmp(argv[1], "usb", 3) == 0)
 		{
 			GCSettings.SaveMethod = DEVICE_USB;
 			GCSettings.LoadMethod = DEVICE_USB;
@@ -411,6 +415,7 @@ int main(int argc, char *argv[])
 		GCSettings.AutoloadGame = AutoloadGame(argv[1], argv[2]);
 		autoboot = GCSettings.AutoloadGame;
 	}
+#endif
 
 	while(1) // main loop
 	{

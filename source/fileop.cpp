@@ -20,6 +20,7 @@
 #include <sdcard/wiisd_io.h>
 #include <sdcard/gcsd.h>
 #include <ogc/usbstorage.h>
+#include <ogc/cond.h>
 #include <di/di.h>
 #include <ogc/dvd.h>
 #include <iso9660.h>
@@ -52,9 +53,6 @@ bool isMounted[9] = { false, false, false, false, false, false, false, false, fa
 	static DISC_INTERFACE* usb = &__io_usbstorage;
 	static DISC_INTERFACE* dvd = &__io_wiidvd;
 #else
-	static DISC_INTERFACE* carda = &__io_gcsda;
-	static DISC_INTERFACE* cardb = &__io_gcsdb;
-	static DISC_INTERFACE* port2 = &__io_gcsd2;
 	static DISC_INTERFACE* dvd = &__io_gcdvd;
 	static DISC_INTERFACE* gcloader = &__io_gcode;
 #endif
@@ -62,14 +60,28 @@ bool isMounted[9] = { false, false, false, false, false, false, false, false, fa
 // folder parsing thread
 static lwp_t parsethread = LWP_THREAD_NULL;
 static DIR *dir = NULL;
-static bool parseHalt = true;
+static volatile bool parseHalt = true;
 static bool parseFilter = true;
 static bool ParseDirEntries();
 int selectLoadedFile = 0;
 
+// parse thread synchronization (no spin-waits)
+static mutex_t parseMutex    = LWP_MUTEX_NULL;
+static cond_t  parseCond     = LWP_COND_NULL; // main -> parse: work available
+static cond_t  parseIdleCond = LWP_COND_NULL; // parse -> main: now idle
+static bool    parseActive   = false;          // protected by parseMutex
+
 // device thread
 static lwp_t devicethread = LWP_THREAD_NULL;
-static bool deviceHalt = true;
+static volatile bool deviceHalt = true;
+
+#ifdef HW_RVL
+// device thread synchronization (no spin-waits)
+static mutex_t deviceMutex    = LWP_MUTEX_NULL;
+static cond_t  deviceWakeCond = LWP_COND_NULL; // main -> device: wake / re-check halt
+static cond_t  deviceHaltCond = LWP_COND_NULL; // device -> main: now halted
+static bool    deviceIdle     = false;          // protected by deviceMutex
+#endif
 
 /****************************************************************************
  * ResumeDeviceThread
@@ -79,8 +91,12 @@ static bool deviceHalt = true;
 void
 ResumeDeviceThread()
 {
+#ifdef HW_RVL
+	LWP_MutexLock(deviceMutex);
 	deviceHalt = false;
-	LWP_ResumeThread(devicethread);
+	LWP_CondSignal(deviceWakeCond);
+	LWP_MutexUnlock(deviceMutex);
+#endif
 }
 
 /****************************************************************************
@@ -93,10 +109,11 @@ HaltDeviceThread()
 {
 #ifdef HW_RVL
 	deviceHalt = true;
-
-	// wait for thread to finish
-	while(!LWP_ThreadIsSuspended(devicethread))
-		usleep(THREAD_SLEEP);
+	LWP_MutexLock(deviceMutex);
+	LWP_CondSignal(deviceWakeCond); // interrupt condvar sleep if the thread is in one
+	while(!deviceIdle)
+		LWP_CondWait(deviceHaltCond, deviceMutex);
+	LWP_MutexUnlock(deviceMutex);
 #endif
 }
 
@@ -109,9 +126,10 @@ void
 HaltParseThread()
 {
 	parseHalt = true;
-
-	while(!LWP_ThreadIsSuspended(parsethread))
-		usleep(THREAD_SLEEP);
+	LWP_MutexLock(parseMutex);
+	while(parseActive)
+		LWP_CondWait(parseIdleCond, parseMutex);
+	LWP_MutexUnlock(parseMutex);
 }
 
 
@@ -121,8 +139,6 @@ HaltParseThread()
  * This checks our devices for changes (SD/USB/DVD removed)
  ***************************************************************************/
 #ifdef HW_RVL
-static int devsleep;
-
 static void *
 devicecallback (void *arg)
 {
@@ -134,6 +150,7 @@ devicecallback (void *arg)
 			{
 				unmountRequired[DEVICE_SD] = true;
 				isMounted[DEVICE_SD] = false;
+				parseHalt = true; // abort any in-progress dir parse on this device
 			}
 		}
 
@@ -143,6 +160,7 @@ devicecallback (void *arg)
 			{
 				unmountRequired[DEVICE_USB] = true;
 				isMounted[DEVICE_USB] = false;
+				parseHalt = true; // abort any in-progress dir parse on this device
 			}
 		}
 
@@ -152,17 +170,24 @@ devicecallback (void *arg)
 			{
 				unmountRequired[DEVICE_DVD] = true;
 				isMounted[DEVICE_DVD] = false;
+				parseHalt = true; // abort any in-progress dir parse on this device
 			}
 		}
 
-		devsleep = 1000*1000; // 1 sec
-
-		while(devsleep > 0)
-		{
-			if(deviceHalt)
-				LWP_SuspendThread(devicethread);
+		// sleep ~1 sec in 100us steps so we can react to a halt request quickly
+		for(int i = 0; i < 10000 && !deviceHalt; i++)
 			usleep(THREAD_SLEEP);
-			devsleep -= THREAD_SLEEP;
+
+		// if halted, block here until ResumeDeviceThread wakes us
+		if(deviceHalt)
+		{
+			LWP_MutexLock(deviceMutex);
+			deviceIdle = true;
+			LWP_CondBroadcast(deviceHaltCond); // tell HaltDeviceThread we've stopped
+			while(deviceHalt)
+				LWP_CondWait(deviceWakeCond, deviceMutex);
+			deviceIdle = false;
+			LWP_MutexUnlock(deviceMutex);
 		}
 	}
 	return NULL;
@@ -172,11 +197,20 @@ devicecallback (void *arg)
 static void *
 parsecallback (void *arg)
 {
+	LWP_MutexLock(parseMutex);
 	while(1)
 	{
+		// sleep until ParseDirectory signals there is work to do
+		while(!parseActive)
+			LWP_CondWait(parseCond, parseMutex);
+		LWP_MutexUnlock(parseMutex);
+
 		while(ParseDirEntries())
 			usleep(THREAD_SLEEP);
-		LWP_SuspendThread(parsethread);
+
+		LWP_MutexLock(parseMutex);
+		parseActive = false;
+		LWP_CondBroadcast(parseIdleCond); // wake HaltParseThread / waitParse callers
 	}
 	return NULL;
 }
@@ -191,9 +225,15 @@ void
 InitDeviceThread()
 {
 #ifdef HW_RVL
-	LWP_CreateThread (&devicethread, devicecallback, NULL, NULL, 0, 40);
+	LWP_MutexInit(&deviceMutex, false);
+	LWP_CondInit(&deviceWakeCond);
+	LWP_CondInit(&deviceHaltCond);
+	LWP_CreateThread(&devicethread, devicecallback, NULL, NULL, 0, 40);
 #endif
-	LWP_CreateThread (&parsethread, parsecallback, NULL, NULL, 0, 80);
+	LWP_MutexInit(&parseMutex, false);
+	LWP_CondInit(&parseCond);
+	LWP_CondInit(&parseIdleCond);
+	LWP_CreateThread(&parsethread, parsecallback, NULL, NULL, 0, 80);
 }
 
 /****************************************************************************
@@ -245,17 +285,17 @@ static bool MountFAT(int device, int silent)
 		case DEVICE_SD_SLOTA:
 			sprintf(name, "carda");
 			sprintf(name2, "carda:");
-			disc = carda;
+			disc = get_io_gcsda();
 			break;
 		case DEVICE_SD_SLOTB:
 			sprintf(name, "cardb");
 			sprintf(name2, "cardb:");
-			disc = cardb;
+			disc = get_io_gcsdb();
 			break;
 		case DEVICE_SD_PORT2:
 			sprintf(name, "port2");
 			sprintf(name2, "port2:");
-			disc = port2;
+			disc = get_io_gcsd2();
 			break;
 		case DEVICE_SD_GCLOADER:
 			sprintf(name, "gcloader");
@@ -277,7 +317,7 @@ static bool MountFAT(int device, int silent)
 
 	while(retry)
 	{
-		if(disc->startup(disc) && fatMountSimple(name, disc))
+		if(fatMountSimple(name, disc))
 			mounted = true;
 
 		if(mounted || silent)
@@ -327,12 +367,8 @@ bool MountDVD(bool silent)
 
 #ifdef HW_DOL
 		DVD_Mount();
-		s32 dvdstatus = DVD_GetDriveStatus();
-
-		if (dvdstatus == DVD_STATE_NO_DISK)
-#else
-		if(!dvd->isInserted(dvd))
 #endif
+		if(!dvd->isInserted(dvd))
 		{
 			if(silent)
 				break;
@@ -424,6 +460,9 @@ char * StripDevice(char * path)
  ***************************************************************************/
 bool ChangeInterface(int device, bool silent)
 {
+	if(device == DEVICE_AUTO)
+		return false;
+
 	if(isMounted[device])
 		return true;
 
@@ -701,14 +740,20 @@ ParseDirectory(bool waitParse, bool filter)
 	parseHalt = false;
 	ParseDirEntries(); // index first 20 entries
 
-	LWP_ResumeThread(parsethread); // index remaining entries
+	// signal parse thread to continue indexing remaining entries
+	LWP_MutexLock(parseMutex);
+	parseActive = true;
+	LWP_CondSignal(parseCond);
+	LWP_MutexUnlock(parseMutex);
 
 	if(waitParse) // wait for complete parsing
 	{
-		ShowAction("Loading...");
+        ShowAction("Loading...");
 
-		while(!LWP_ThreadIsSuspended(parsethread))
-			usleep(THREAD_SLEEP);
+		LWP_MutexLock(parseMutex);
+		while(parseActive)
+			LWP_CondWait(parseIdleCond, parseMutex);
+		LWP_MutexUnlock(parseMutex);
 
 		CancelAction();
 	}
@@ -716,16 +761,21 @@ ParseDirectory(bool waitParse, bool filter)
 	return browser.numEntries;
 }
 
-bool CreateDirectory(char * path)
-{
+bool DirExists(const char * path) {
 	DIR *dir = opendir(path);
-	if (!dir) {
-		if(mkdir(path, 0777) != 0) {
-			return false;
-		}
-	}
-	else {
+	if (dir) {
 		closedir(dir);
+		return true;
+	}
+	return false;
+}
+
+bool CreateDirectory(char * path) {
+	if(DirExists(path)) {
+		return true;
+	}
+	if(mkdir(path, 0777) != 0) {
+		return false;
 	}
 	return true;
 }

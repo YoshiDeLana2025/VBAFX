@@ -51,11 +51,13 @@ bool SGBBorderLoadedFromGame = false;
 /*** 3D GX ***/
 #define DEFAULT_FIFO_SIZE ( 256 * 1024 )
 static u8 gp_fifo[DEFAULT_FIFO_SIZE] ATTRIBUTE_ALIGN(32);
-static unsigned int copynow = GX_FALSE;
+static volatile unsigned int copynow = GX_FALSE;
 
 /*** Texture memory ***/
-static u8 *texturemem = NULL;
-static int texturesize;
+#define TEX_WIDTH 640
+#define TEX_HEIGHT 480
+#define TEXTUREMEM_SIZE 	TEX_WIDTH*TEX_HEIGHT*2
+static u8 texturemem[TEXTUREMEM_SIZE] ATTRIBUTE_ALIGN (32);
 
 static GXTexObj texobj;
 static Mtx view;
@@ -94,25 +96,26 @@ static camera cam = { {0.0F, 0.0F, 0.0F},
 /****************************************************************************
  * VideoThreading
  ***************************************************************************/
-#define TSTACK 16384
-static lwp_t vbthread;
-static unsigned char vbstack[TSTACK];
+static lwp_t vbthread = LWP_THREAD_NULL;
+static lwpq_t render_queue;          // Queue for the main thread to sleep on
+static lwpq_t vb_queue;              // Queue for the VSync thread to sleep on
+static volatile bool vb_done = true; // Tracks if the VSync thread has completed its wait
 
 /****************************************************************************
  * vbgetback
  *
  * This callback enables the emulator to keep running while waiting for a
  * vertical blank.
- *
- * Putting LWP to good use :)
  ***************************************************************************/
 static void *
 vbgetback (void *arg)
 {
 	while (1)
 	{
-		VIDEO_WaitVSync ();	 /**< Wait for video vertical blank */
-		LWP_SuspendThread (vbthread);
+		LWP_ThreadSleep(vb_queue);     // Sleep until kicked off at the end of GX_Render
+		VIDEO_WaitVSync ();	         /**< Wait for video vertical blank */
+		vb_done = true;
+		LWP_ThreadSignal(render_queue); // Instantly alert the main thread if it is waiting
 	}
 	return NULL;
 }
@@ -131,6 +134,7 @@ copy_to_xfb (u32 arg)
 		GX_CopyDisp (xfb[whichfb], GX_TRUE);
 		GX_Flush ();
 		copynow = GX_FALSE;
+		LWP_ThreadSignal(render_queue); // Wake up the main thread if it is waiting for the copy
 	}
 	++FrameTimer;
 }
@@ -142,11 +146,9 @@ static inline void draw_init(void)
 {
 	GX_ClearVtxDesc ();
 	GX_SetVtxDesc (GX_VA_POS, GX_INDEX8);
-	GX_SetVtxDesc (GX_VA_CLR0, GX_INDEX8);
 	GX_SetVtxDesc (GX_VA_TEX0, GX_DIRECT);
 
 	GX_SetVtxAttrFmt (GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S16, 0);
-	GX_SetVtxAttrFmt (GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
 	GX_SetVtxAttrFmt (GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
 
 	GX_SetArray (GX_VA_POS, square, 3 * sizeof (s16));
@@ -165,16 +167,15 @@ static inline void draw_init(void)
 
 	GX_InvVtxCache ();	// update vertex cache
 
-	GX_InitTexObj(&texobj, texturemem, vwidth, vheight, GX_TF_RGB565,
-		GX_CLAMP, GX_CLAMP, GX_FALSE);
-	if (GCSettings.render == 2)
-		GX_InitTexObjLOD(&texobj,GX_NEAR,GX_NEAR_MIP_NEAR,2.5,9.0,0.0,GX_FALSE,GX_FALSE,GX_ANISO_1); // original/unfiltered video mode: force texture filtering OFF
+	GX_InitTexObj(&texobj, texturemem, vwidth, vheight, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
+
+	if (GCSettings.render == RENDER_UNFILTERED)
+		GX_InitTexObjFilterMode(&texobj,GX_NEAR,GX_NEAR); // original/unfiltered video mode: force texture filtering OFF
 }
 
-static inline void draw_vert(u8 pos, u8 c, f32 s, f32 t)
+static inline void draw_vert(u8 pos, f32 s, f32 t)
 {
 	GX_Position1x8(pos);
-	GX_Color1x8(c);
 	GX_TexCoord2f32(s, t);
 }
 
@@ -198,10 +199,10 @@ static inline void draw_square(Mtx v)
 
 	GX_LoadPosMtxImm(mv, GX_PNMTX0);
 	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-	draw_vert(0, 0, 0.0, 0.0);
-	draw_vert(1, 0, 1.0, 0.0);
-	draw_vert(2, 0, 1.0, 1.0);
-	draw_vert(3, 0, 0.0, 1.0);
+	draw_vert(0, 0.0, 0.0);
+	draw_vert(1, 1.0, 0.0);
+	draw_vert(2, 1.0, 1.0);
+	draw_vert(3, 0.0, 1.0);
 	GX_End();
 }
 
@@ -228,20 +229,18 @@ static inline void draw_cursor(Mtx v)
 	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 
 	// I needed to hack the texture coords to cut out the opaque bit around the outside
-	draw_vert(0, 0, 0.4, 0.45);
-	draw_vert(1, 0, 0.76, 0.45);
-	draw_vert(2, 0, 0.76, 0.97);
-	draw_vert(3, 0, 0.4, 0.97);
+	draw_vert(0, 0.4, 0.45);
+	draw_vert(1, 0.76, 0.45);
+	draw_vert(2, 0.76, 0.97);
+	draw_vert(3, 0.4, 0.97);
 
 	GX_End();
 
 	GX_ClearVtxDesc ();
 	GX_SetVtxDesc (GX_VA_POS, GX_INDEX8);
-	GX_SetVtxDesc (GX_VA_CLR0, GX_INDEX8);
 	GX_SetVtxDesc (GX_VA_TEX0, GX_DIRECT);
 
 	GX_SetVtxAttrFmt (GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S16, 0);
-	GX_SetVtxAttrFmt (GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
 	GX_SetVtxAttrFmt (GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
 
 	GX_SetArray (GX_VA_POS, square, 3 * sizeof (s16));
@@ -251,10 +250,10 @@ static inline void draw_cursor(Mtx v)
 
 	GX_InvVtxCache ();	// update vertex cache
 
-	GX_InitTexObj(&texobj, texturemem, vwidth, vheight, GX_TF_RGB565,
-		GX_CLAMP, GX_CLAMP, GX_FALSE);
-	if (GCSettings.render == 2)
-		GX_InitTexObjLOD(&texobj,GX_NEAR,GX_NEAR_MIP_NEAR,2.5,9.0,0.0,GX_FALSE,GX_FALSE,GX_ANISO_1); // original/unfiltered video mode: force texture filtering OFF
+	GX_InitTexObj(&texobj, texturemem, vwidth, vheight, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
+
+	if (GCSettings.render == RENDER_UNFILTERED)
+		GX_InitTexObjFilterMode(&texobj,GX_NEAR,GX_NEAR); // original/unfiltered video mode: force texture filtering OFF
 }
 #endif
 
@@ -268,7 +267,7 @@ void StopGX()
 	GX_AbortFrame();
 	GX_Flush();
 
-	VIDEO_SetBlack(TRUE);
+	VIDEO_SetBlack(true);
 	VIDEO_Flush();
 }
 
@@ -285,40 +284,31 @@ static GXRModeObj * FindVideoMode()
 	// choose the desired video mode
 	switch(GCSettings.videomode)
 	{
-		case 1: // NTSC (480i)
+		case VIDEOMODE_NTSC: // NTSC (480i)
 			mode = &TVNtsc480IntDf;
 			break;
-		case 2: // Progressive (480p)
+		case VIDEOMODE_PROGRESSIVE: // Progressive (480p)
 			mode = &TVNtsc480Prog;
 			break;
-		case 3: // PAL (50Hz)
+		case VIDEOMODE_PAL: // PAL (50Hz)
 			mode = &TVPal576IntDfScale;
 			break;
-		case 4: // PAL (60Hz)
+		case VIDEOMODE_EURGB: // PAL (60Hz)
 			mode = &TVEurgb60Hz480IntDf;
 			break;
-		case 5: // NTSC (240p)
+		case VIDEOMODE_240P: // NTSC (240p)
 			mode = &TVNtsc240Ds;
 			break;
-		case 6: // PAL (60Hz 240p)
+		case VIDEOMODE_EURGB_240P: // PAL (60Hz 240p)
 			mode = &TVEurgb60Hz240Ds;
 			break;
 		default:
 			mode = VIDEO_GetPreferredMode(NULL);
-
-			#ifdef HW_DOL
-			/* we have component cables, but the preferred mode is interlaced
-			 * why don't we switch into progressive?
-			 * on the Wii, the user can do this themselves on their Wii Settings */
-			if(VIDEO_HaveComponentCable())
-				mode = &TVNtsc480Prog;
-			#endif
-
 			break;
 	}
 
 	// check for progressive scan
-	if (mode->viTVMode == VI_TVMODE_NTSC_PROG)
+	if ((mode->viTVMode & 3) == VI_PROGRESSIVE)
 		progressive = true;
 	else
 		progressive = false;
@@ -329,7 +319,7 @@ static GXRModeObj * FindVideoMode()
 	else
 		mode->viWidth = 672;
 
-	if (mode->viTVMode >> 2 == VI_PAL)
+    if ((mode->viTVMode >> 2) == VI_PAL)
 	{
 		mode->viXOrigin = (VI_MAX_WIDTH_PAL - mode->viWidth) / 2;
 		mode->viYOrigin = (VI_MAX_HEIGHT_PAL - mode->viHeight) / 2;
@@ -363,15 +353,9 @@ static void SetupVideoMode(GXRModeObj * mode)
 	VIDEO_ClearFrameBuffer (mode, xfb[1], COLOR_BLACK);
 	VIDEO_SetNextFramebuffer (xfb[0]);
 
-	VIDEO_SetBlack (FALSE);
+	VIDEO_SetBlack (false);
 	VIDEO_Flush ();
-	VIDEO_WaitVSync ();
-		
-	if (mode->viTVMode & VI_NON_INTERLACE)
-		VIDEO_WaitVSync();
-	else
-		while (VIDEO_GetNextField())
-			VIDEO_WaitVSync();
+	VIDEO_WaitForFlush ();
 	
 	VIDEO_SetPostRetraceCallback ((VIRetraceCallback)copy_to_xfb);
 	vmode = mode;
@@ -389,28 +373,34 @@ InitializeVideo ()
 {
 	VIDEO_Init();
 
-	// Allocate the video buffers
-	xfb[0] = (u32 *) memalign(32, 640*576*2);
-	xfb[1] = (u32 *) memalign(32, 640*576*2);
-	DCInvalidateRange(xfb[0], 640*576*2);
-	DCInvalidateRange(xfb[1], 640*576*2);
+	// Allocate the video buffers. Sized for the largest supported mode
+	// (640x576, 2 bytes per pixel) so the same buffers serve every mode.
+	const u32 xfbSize = 640 * 576 * 2;
+	xfb[0] = (u32 *) memalign(32, xfbSize);
+	xfb[1] = (u32 *) memalign(32, xfbSize);
+	DCInvalidateRange(xfb[0], xfbSize);
+	DCInvalidateRange(xfb[1], xfbSize);
 	xfb[0] = (u32 *) MEM_K0_TO_K1 (xfb[0]);
 	xfb[1] = (u32 *) MEM_K0_TO_K1 (xfb[1]);
 
 	GXRModeObj *rmode = FindVideoMode();
 	SetupVideoMode(rmode);
 
-	LWP_CreateThread (&vbthread, vbgetback, NULL, vbstack, TSTACK, 68);
+	// Setup synchronization queues
+	LWP_InitQueue(&render_queue);
+	LWP_InitQueue(&vb_queue);
+	vb_done = true;
+
+	LWP_CreateThread (&vbthread, vbgetback, NULL, NULL, 0, 68);
 
 	// Initialise GX
 	GXColor background = { 0, 0, 0, 0xff };
 	memset (gp_fifo, 0, DEFAULT_FIFO_SIZE);
 	GX_Init (&gp_fifo, DEFAULT_FIFO_SIZE);
-	GX_SetCopyClear (background, 0x00ffffff);
+	GX_SetCopyClear (background, GX_MAX_Z24);
 	GX_SetDispCopyGamma (GX_GM_1_0);
 	GX_SetCullMode (GX_CULL_NONE);
 }
-
 
 static inline void UpdateScaling()
 {
@@ -421,9 +411,9 @@ static inline void UpdateScaling()
 	float GameboyAspectRatio;
 	float MaxStretchRatio = 1.6f;
 
-	if (GCSettings.scaling == 1)
+	if (GCSettings.scaling == SCALING_PARTIAL_STRETCH)
 		MaxStretchRatio = 1.3f;
-	else if (GCSettings.scaling == 2)
+	else if (GCSettings.scaling == SCALING_STRETCH_TO_FIT)
 		MaxStretchRatio = 1.6f;
 	else
 		MaxStretchRatio = 1.0f;
@@ -434,7 +424,7 @@ static inline void UpdateScaling()
 	else
 		TvAspectRatio = 4.0f/3.0f;
 	#else
-	if (GCSettings.scaling == 3)
+	if (GCSettings.scaling == SCALING_WIDESCREEN_CORRECTION)
 		TvAspectRatio = 16.0f/9.0f;
 	else
 		TvAspectRatio = 4.0f/3.0f;
@@ -462,7 +452,7 @@ static inline void UpdateScaling()
 	// change zoom
 	float zoomHor, zoomVert;
 	int fixed;
-	if (cartridgeType == 2) // GBA
+	if (cartridgeType == CARTRIDGE_GBA)
 	{
 		zoomHor = GCSettings.gbaZoomHor;
 		zoomVert = GCSettings.gbaZoomVert;
@@ -511,7 +501,7 @@ static inline void UpdateScaling()
 		float vh = vheight * ratio;
 		
 		// 240p adjustment
-		if (GCSettings.videomode == 5 || GCSettings.videomode == 6) vw *= 2;
+		if (GCSettings.videomode == VIDEOMODE_240P || GCSettings.videomode == VIDEOMODE_EURGB_240P) vw *= 2;
 		
 		float vx = (vmode->fbWidth - vw) / 2;
 		float vy = (vmode->efbHeight - vh) / 2;
@@ -546,10 +536,10 @@ ResetVideo_Emu ()
 	u8 sharp[7] = {0,0,21,22,21,0,0};
 	u8 soft[7] = {8,8,10,12,10,8,8};
 	u8* vfilter =
-		GCSettings.render == 3 ? sharp
-		: GCSettings.render == 4 ? soft
+		GCSettings.render == RENDER_FILTERED_SHARP ? sharp
+		: GCSettings.render == RENDER_FILTERED_SOFT ? soft
 		: rmode->vfilter;
-	GX_SetCopyFilter (rmode->aa, rmode->sample_pattern, (GCSettings.render != 2) ? GX_TRUE : GX_FALSE, vfilter);	// deflickering filter only for filtered mode
+	GX_SetCopyFilter (rmode->aa, rmode->sample_pattern, (GCSettings.render != RENDER_UNFILTERED) ? GX_TRUE : GX_FALSE, vfilter);	// deflickering filter only for filtered mode
 
 	GX_SetFieldMode (rmode->field_rendering, ((rmode->viHeight == 2 * rmode->xfbHeight) ? GX_ENABLE : GX_DISABLE));
 	
@@ -568,8 +558,9 @@ ResetVideo_Emu ()
 	// reinitialize texture
 	GX_InvalidateTexAll ();
 	GX_InitTexObj (&texobj, texturemem, vwidth, vheight, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);	// initialize the texture obj we are going to use
-	if (GCSettings.render == 2)
-		GX_InitTexObjLOD(&texobj,GX_NEAR,GX_NEAR_MIP_NEAR,2.5,9.0,0.0,GX_FALSE,GX_FALSE,GX_ANISO_1); // original/unfiltered video mode: force texture filtering OFF
+
+	if (GCSettings.render == RENDER_UNFILTERED)
+		GX_InitTexObjFilterMode(&texobj,GX_NEAR,GX_NEAR); // original/unfiltered video mode: force texture filtering OFF
 
 	GX_Flush();
 	draw_init();
@@ -578,140 +569,342 @@ ResetVideo_Emu ()
 	updateScaling = 1;
 }
 
-void GX_Render_Init(int width, int height)
-{
-	if (texturemem)
-		free(texturemem);
+static const u16* lastCopiedBorder = NULL;
+static int sgbBorderCheckCounter = 0;
+static bool borderJustChanged = false;
 
-	/*** Allocate 32byte aligned texture memory ***/
-	texturesize = (width * height) * 2;
-
-	texturemem = (u8 *) memalign(32, texturesize);
-
-	memset(texturemem, 0, texturesize);
+/****************************************************************************
+ * GX_Render_Init
+ ***************************************************************************/
+void GX_Render_Init(int width, int height) {
+	memset(texturemem, 0, TEXTUREMEM_SIZE);
 
 	/*** Setup for first call to scaler ***/
 	vwidth = width;
 	vheight = height;
+
+	// Reset state trackers upon texture recreation
+	lastCopiedBorder = NULL;
+	sgbBorderCheckCounter = 0;
+	borderJustChanged = false;
 }
 
-bool borderAreaEmpty(const u16* buffer) {
+static bool borderAreaEmpty(const u16* buffer) {
 	u16 reference = buffer[0];
-	for (int y=0; y<40; y++) {
-		for (int x=0; x<256; x++) {
-			if (buffer[258*y + x] != reference) return false;
+	for (int y = 0; y < 40; y++) {
+		for (int x = 0; x < 256; x++) {
+			if (buffer[256 * y + x] != reference)
+				return false;
 		}
 	}
-	for (int y=40; y<184; y++) {
-		for (int x=0; x<48; x++) {
-			if (buffer[258*y + x] != reference) return false;
+	for (int y = 40; y < 184; y++) {
+		for (int x = 0; x < 48; x++) {
+			if (buffer[256 * y + x] != reference)
+				return false;
 		}
-		for (int x=208; x<224; x++) {
-			if (buffer[258*y + x] != reference) return false;
+		for (int x = 208; x < 224; x++) {
+			if (buffer[256 * y + x] != reference)
+				return false;
 		}
 	}
-	for (int y=184; y<224; y++) {
-		for (int x=0; x<256; x++) {
-			if (buffer[258*y + x] != reference) return false;
+	for (int y = 184; y < 224; y++) {
+		for (int x = 0; x < 256; x++) {
+			if (buffer[256 * y + x] != reference)
+				return false;
 		}
 	}
 	return true;
 }
 
 /****************************************************************************
-* GX_Render
-*
-* Pass in a buffer, width and height to update as a tiled RGB565 texture
-* (2 bytes per pixel)
-****************************************************************************/
+ * ProcessSGBBorder
+ ***************************************************************************/
+static void ProcessSGBBorder(u8* buffer, int gbWidth, int gbHeight) {
+	if (gbWidth == 256 && gbHeight == 224 && !SGBBorderLoadedFromGame) {
+		// Throttle heavy pixel scanning path to once per second
+		sgbBorderCheckCounter++;
+		if (sgbBorderCheckCounter >= 60) {
+			sgbBorderCheckCounter = 0;
+			if (!borderAreaEmpty((u16*)buffer)) {
+				// don't try to load the default border anymore
+				SGBBorderLoadedFromGame = true;
+				SaveSGBBorderIfNoneExists(buffer);
+			}
+		}
+	}
+}
+
+/****************************************************************************
+ * DrawBorderAndGetDest
+ ***************************************************************************/
+static long long int* DrawBorderAndGetDest(void* textureBase, int gbWidth, int gbHeight, int borderWidth, int borderHeight) {
+	long long int* dst = (long long int*) textureBase;
+	borderJustChanged = false;
+
+	if (InitialBorder) {
+		// Only copy the 600 KB border once when it changes!
+		if (InitialBorder != lastCopiedBorder) {
+			memcpy(dst, InitialBorder, borderWidth * borderHeight * 2);
+			lastCopiedBorder = InitialBorder;
+			borderJustChanged = true; // Signal that the GPU needs a full RAM sync
+		}
+
+		int rows_to_skip = (borderHeight - gbHeight) / 2;
+		if (rows_to_skip > 0)
+			dst += rows_to_skip * borderWidth / 4;
+		dst += (borderWidth - gbWidth) / 2;
+	} else {
+		lastCopiedBorder = NULL; // Reset tracking if running borderless
+	}
+
+	return dst;
+}
+
+/****************************************************************************
+ * MakeTextureVBA
+ *
+ * High-performance texture swizzling (Linear to 4x4 Tiled)
+ * specifically optimized for VBA GX's dynamic widths and border gaps.
+ * Uses a pipelined 32-bit integer strategy to strictly enforce 4-byte
+ * alignment.
+ ***************************************************************************/
+/****************************************************************************
+ * MakeTextureVBA_Impl (Static Template)
+ *
+ * Employs compile-time constants to embed memory offsets directly into
+ * the PowerPC load instructions. Completely eliminates pointer arithmetic
+ * from the inner loop.
+ ***************************************************************************/
+template <int PITCH>
+static inline void MakeTextureVBA_Impl(const void *src, void *dst, s32 width, s32 height, s32 dst_gap_bytes)
+{
+    u32 src_row_stride = PITCH * 4;
+    u32 r_src_row;
+    u32 tmpA, tmpB, tmpC, tmpD;
+
+    __asm__ __volatile__ (
+        "srwi   %[width], %[width], 2\n"
+        "srwi   %[height], %[height], 2\n"
+
+    "2: mtctr   %[width]\n"
+        "mr     %[r_src_row], %[src]\n"
+
+    "1: dcbz    0, %[dst]\n"
+
+        // Load Row 0
+        "lwz    %[tmpA], 0(%[src])\n"
+        "lwz    %[tmpB], 4(%[src])\n"
+
+        // Load Row 1, Store Row 0
+        "lwz    %[tmpC], %c[p1](%[src])\n"
+        "stw    %[tmpA], 0(%[dst])\n"
+        "lwz    %[tmpD], %c[p1_4](%[src])\n"
+        "stw    %[tmpB], 4(%[dst])\n"
+
+        // Load Row 2, Store Row 1
+        "lwz    %[tmpA], %c[p2](%[src])\n"
+        "stw    %[tmpC], 8(%[dst])\n"
+        "lwz    %[tmpB], %c[p2_4](%[src])\n"
+        "stw    %[tmpD], 12(%[dst])\n"
+
+        // Load Row 3, Store Row 2
+        "lwz    %[tmpC], %c[p3](%[src])\n"
+        "stw    %[tmpA], 16(%[dst])\n"
+        "lwz    %[tmpD], %c[p3_4](%[src])\n"
+        "stw    %[tmpB], 20(%[dst])\n"
+
+        // Store Row 3
+        "stw    %[tmpC], 24(%[dst])\n"
+        "stw    %[tmpD], 28(%[dst])\n"
+
+        // Advance inner loop (X)
+        "addi   %[src], %[src], 8\n"
+        "addi   %[dst], %[dst], 32\n"
+        "bdnz   1b\n"
+
+        // Advance outer loop (Y)
+        "add    %[src], %[r_src_row], %[src_row_stride]\n"
+        "add    %[dst], %[dst], %[dst_gap_bytes]\n"
+
+        "subic. %[height], %[height], 1\n"
+        "bne    2b\n"
+
+        : [r_src_row] "=&b" (r_src_row),
+          [tmpA] "=&r" (tmpA),
+          [tmpB] "=&r" (tmpB),
+          [tmpC] "=&r" (tmpC),
+          [tmpD] "=&r" (tmpD),
+          [src] "+b" (src),
+          [dst] "+b" (dst),
+          [width] "+r" (width),
+          [height] "+r" (height)
+        : [p1] "n" (PITCH),
+          [p1_4] "n" (PITCH + 4),
+          [p2] "n" (PITCH * 2),
+          [p2_4] "n" (PITCH * 2 + 4),
+          [p3] "n" (PITCH * 3),
+          [p3_4] "n" (PITCH * 3 + 4),
+          [src_row_stride] "r" (src_row_stride),
+          [dst_gap_bytes] "r" (dst_gap_bytes)
+        : "memory", "cc"
+    );
+}
+
+// Fallback for custom/bizarre resolutions (Uses dynamic row_ptr)
+static void MakeTextureVBA_Dynamic(const void *src, void *dst, s32 width, s32 height, s32 pitch, s32 dst_gap_bytes)
+{
+    u32 src_row_stride = pitch * 4;
+    u32 r_src_row, row_ptr;
+    u32 tmpA, tmpB, tmpC, tmpD;
+
+    __asm__ __volatile__ (
+        "srwi   %[width], %[width], 2\n"       // num_tiles_x = width / 4
+        "srwi   %[height], %[height], 2\n"     // num_tiles_y = height / 4
+
+    "2: mtctr   %[width]\n"                    // Set inner loop counter (X)
+        "mr     %[r_src_row], %[src]\n"        // Save the start of the current source 4-row block
+
+    "1: dcbz    0, %[dst]\n"                   // ZERO L1 CACHE: Dest is perfectly 32-byte aligned
+        "mr     %[row_ptr], %[src]\n"
+
+        // Load Row 0
+        "lwz    %[tmpA], 0(%[row_ptr])\n"
+        "lwz    %[tmpB], 4(%[row_ptr])\n"
+        "add    %[row_ptr], %[row_ptr], %[pitch]\n"
+
+        // Load Row 1, Store Row 0
+        // Interleaving hides the 3-cycle load latency
+        "lwz    %[tmpC], 0(%[row_ptr])\n"
+        "stw    %[tmpA], 0(%[dst])\n"
+        "lwz    %[tmpD], 4(%[row_ptr])\n"
+        "stw    %[tmpB], 4(%[dst])\n"
+        "add    %[row_ptr], %[row_ptr], %[pitch]\n"
+
+        // Load Row 2, Store Row 1
+        "lwz    %[tmpA], 0(%[row_ptr])\n"      // Recycle tmpA and tmpB
+        "stw    %[tmpC], 8(%[dst])\n"
+        "lwz    %[tmpB], 4(%[row_ptr])\n"
+        "stw    %[tmpD], 12(%[dst])\n"
+        "add    %[row_ptr], %[row_ptr], %[pitch]\n"
+
+        // Load Row 3, Store Row 2
+        "lwz    %[tmpC], 0(%[row_ptr])\n"
+        "stw    %[tmpA], 16(%[dst])\n"
+        "lwz    %[tmpD], 4(%[row_ptr])\n"
+        "stw    %[tmpB], 20(%[dst])\n"
+
+        // Store Row 3
+        "stw    %[tmpC], 24(%[dst])\n"
+        "stw    %[tmpD], 28(%[dst])\n"
+
+        // Advance pointers for the next tile in the row
+        "addi   %[src], %[src], 8\n"           // Advance src X by 4 pixels (8 bytes)
+        "addi   %[dst], %[dst], 32\n"          // Advance dst by 1 full tile (32 bytes)
+        "bdnz   1b\n"                          // Decrement CTR, loop inner if > 0
+
+        // Advance pointers to the next row of tiles
+        "add    %[src], %[r_src_row], %[src_row_stride]\n" // Jump down 4 source rows
+        "add    %[dst], %[dst], %[dst_gap_bytes]\n"        // Skip right/left borders in dest
+
+        "subic. %[height], %[height], 1\n"     // Decrement height counter (Y)
+        "bne    2b\n"                          // Loop outer if > 0
+
+        : [r_src_row] "=&b" (r_src_row),
+          [row_ptr] "=&b" (row_ptr),
+          [tmpA] "=&r" (tmpA),
+          [tmpB] "=&r" (tmpB),
+          [tmpC] "=&r" (tmpC),
+          [tmpD] "=&r" (tmpD),
+          [src] "+b" (src),
+          [dst] "+b" (dst),
+          [width] "+r" (width),
+          [height] "+r" (height)
+        : [pitch] "r" (pitch),
+          [src_row_stride] "r" (src_row_stride),
+          [dst_gap_bytes] "r" (dst_gap_bytes)
+        : "memory", "cc"
+    );
+}
+
+/****************************************************************************
+ * WriteFrameToTextureMemory
+ ****************************************************************************/
+void WriteFrameToTextureMemory(u8* srcBuffer, void* textureBase, int width, int height)
+{
+    int borderWidth = InitialBorder ? InitialBorderWidth : width;
+    int borderHeight = InitialBorder ? InitialBorderHeight : height;
+
+    ProcessSGBBorder(srcBuffer, width, height);
+    long long int* dst_ptr = DrawBorderAndGetDest(textureBase, width, height, borderWidth, borderHeight);
+
+    int gbPitch = width * 2 + 4;
+    int dst_gap_bytes = ((borderWidth - width) / 4) * 32;
+
+    // Route to the statically optimized ASM based on console resolution width
+    switch (width) {
+        case 160: // GB / GBC (Pitch = 324)
+            MakeTextureVBA_Impl<324>(srcBuffer, dst_ptr, width, height, dst_gap_bytes);
+            break;
+        case 240: // GBA (Pitch = 484)
+            MakeTextureVBA_Impl<484>(srcBuffer, dst_ptr, width, height, dst_gap_bytes);
+            break;
+        case 256: // SGB (Pitch = 516)
+            MakeTextureVBA_Impl<516>(srcBuffer, dst_ptr, width, height, dst_gap_bytes);
+            break;
+        default:  // Fallback for custom borders/resolutions
+            MakeTextureVBA_Dynamic(srcBuffer, dst_ptr, width, height, gbPitch, dst_gap_bytes);
+            break;
+    }
+
+    // High-efficiency targeted data cache flushing
+    if (InitialBorder && !borderJustChanged) {
+        // Normal Frame: Flush ONLY the game screen cache lines (Saves ~87% bus bandwidth)
+        u8* flush_ptr = (u8*)dst_ptr;
+        u32 row_bytes = width * 8;         // bytes per tile row for game screen
+        u32 stride_bytes = borderWidth * 8; // full texture pitch stride bytes
+        int tile_rows = height / 4;
+        for (int i = 0; i < tile_rows; i++) {
+            DCStoreRange(flush_ptr, row_bytes);
+            flush_ptr += stride_bytes;
+        }
+    } else {
+        // Flush everything if borderless, OR if the border was just copied this frame
+        DCStoreRange(textureBase, borderWidth * borderHeight * 2);
+    }
+}
+
+/****************************************************************************
+ * GX_Render
+ *
+ * Pass in a buffer, width and height to update as a tiled RGB565 texture
+ * (2 bytes per pixel)
+ ****************************************************************************/
 void GX_Render(int gbWidth, int gbHeight, u8 * buffer)
 {
 	int borderWidth = InitialBorder ? InitialBorderWidth : gbWidth;
 	int borderHeight = InitialBorder ? InitialBorderHeight : gbHeight;
 
-	int h, w;
-	int gbPitch = gbWidth * 2 + 4;
-	long long int *dst = (long long int *) texturemem; // Pointer in 8-byte units / 4-pixel units
-	long long int *src1 = (long long int *) buffer;
-	long long int *src2 = (long long int *) (buffer + gbPitch);
-	long long int *src3 = (long long int *) (buffer + (gbPitch << 1));
-	long long int *src4 = (long long int *) (buffer + (gbPitch * 3));
-	int srcrowpitch = (gbPitch >> 3) * 3;
-	int srcrowadjust = ( gbPitch % 8 ) << 2;
-	int dstrowpitch = borderWidth - gbWidth;
-
 	vwidth = borderWidth;
 	vheight = borderHeight;
 
-	int vwid2 = (gbWidth >> 2);
-	char *ra = NULL;
-	
-	// Ensure previous vb has complete
-	while ((LWP_ThreadIsSuspended (vbthread) == 0) || (copynow == GX_TRUE))
-		usleep (50);
+	// Ensure previous frame copy and background VSync block have finished cleanly
+	while (!vb_done || (copynow == GX_TRUE))
+	{
+		LWP_ThreadSleep(render_queue); // Halts main thread with 0 CPU load until signals occur
+	}
 
 	whichfb ^= 1;
 
 	if(updateScaling)
 		UpdateScaling();
 
-	// clear texture objects
-	GX_InvVtxCache();
 	GX_InvalidateTexAll();
-	GX_SetTevOp(GX_TEVSTAGE0, GX_DECAL);
-	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
-	
-	if (gbWidth == 256 && gbHeight == 224 && !SGBBorderLoadedFromGame) {
-		if (borderAreaEmpty((u16*)buffer)) {
-			// TODO: don't paint empty SGB border
-		} else {
-			// don't try to load the default border anymore
-			SGBBorderLoadedFromGame = true;
-			SaveSGBBorderIfNoneExists(buffer);
-		}
-	}
-	
-	// The InitialBorder, if any, should already be properly tiled
-	if (InitialBorder) {
-		memcpy(dst, InitialBorder, borderWidth * borderHeight * 2);
-		
-		int rows_to_skip = (borderHeight - gbHeight) / 2;
-		if (rows_to_skip > 0) dst += rows_to_skip * borderWidth / 4;
-		dst += (borderWidth - gbWidth) / 2;
-	}
-	
-	for (h = 0; h < gbHeight; h += 4)
-	{
-		for (w = 0; w < vwid2; ++w)
-		{
-			*dst++ = *src1++;
-			*dst++ = *src2++;
-			*dst++ = *src3++;
-			*dst++ = *src4++;
-		}
+	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
 
-		src1 += srcrowpitch;
-		src2 += srcrowpitch;
-		src3 += srcrowpitch;
-		src4 += srcrowpitch;
-		dst += dstrowpitch;
-
-		if ( srcrowadjust )
-		{
-			ra = (char *)src1;
-			src1 = (long long int *)(ra + srcrowadjust);
-			ra = (char *)src2;
-			src2 = (long long int *)(ra + srcrowadjust);
-			ra = (char *)src3;
-			src3 = (long long int *)(ra + srcrowadjust);
-			ra = (char *)src4;
-			src4 = (long long int *)(ra + srcrowadjust);
-		}
-	}
-	
 	// load texture into GX
-	DCFlushRange(texturemem, texturesize);
-
+	WriteFrameToTextureMemory(buffer, texturemem, gbWidth, gbHeight);
+	
 	GX_SetNumChans(1);
 	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 	GX_SetColorUpdate(GX_TRUE);
@@ -735,8 +928,9 @@ void GX_Render(int gbWidth, int gbHeight, u8 * buffer)
 	VIDEO_Flush();
 	copynow = GX_TRUE;
 
-	// Return to caller, don't waste time waiting for vb
-	LWP_ResumeThread (vbthread);
+	// Reset state and signal background VSync thread to begin waiting for next blanking interval
+	vb_done = false;
+	LWP_ThreadSignal(vb_queue);
 }
 
 /****************************************************************************
@@ -752,7 +946,17 @@ void TakeScreenshot()
 	{
 		gameScreenPngSize = PNGU_EncodeFromEFB(pngContext, vmode->fbWidth, vmode->efbHeight);
 		PNGU_ReleaseImageContext(pngContext);
-		gameScreenPng = (u8 *)malloc(gameScreenPngSize);
+
+		if (gameScreenPngSize <= 0) {
+			gameScreenPngSize = 0;
+			return;
+		}
+
+		gameScreenPng = (u8 *) malloc(gameScreenPngSize);
+		if (gameScreenPng == NULL) {
+			gameScreenPngSize = 0;
+			return;
+		}
 		memcpy(gameScreenPng, savebuffer, gameScreenPngSize);
 	}
 }
@@ -792,7 +996,7 @@ ResetVideo_Menu ()
 
 	// clears the bg to color and clears the z buffer
 	GXColor background = {0, 0, 0, 255};
-	GX_SetCopyClear (background, 0x00ffffff);
+	GX_SetCopyClear (background, GX_MAX_Z24);
 
 	yscale = GX_GetYScaleFactor(vmode->efbHeight,vmode->xfbHeight);
 	xfbHeight = GX_SetDispCopyYScale(yscale);
@@ -854,7 +1058,7 @@ void Menu_Render()
 	GX_DrawDone();
 	VIDEO_SetNextFramebuffer(xfb[whichfb]);
 	VIDEO_Flush();
-	VIDEO_WaitVSync();
+	VIDEO_WaitForFlush();
 }
 
 /****************************************************************************
