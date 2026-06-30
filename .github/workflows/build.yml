@@ -1,4 +1,4 @@
-name: VBA FX Build
+name: VBA FX Build (Wii)
 
 on: workflow_dispatch
 
@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        image: ["Wii", "GameCube"]
+        image: ["Wii"]
     container: ghcr.io/extremscorner/libogc2:20260411
 
     steps:
@@ -34,29 +34,10 @@ jobs:
         cp executables/vbafx-wii.dol dist/VisualBoyAdvanceFX/apps/vbafx/boot.dol
 
     - name: Upload Wii artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       if: ${{ matrix.image == 'Wii' }}
       with:
         name: VisualBoyAdvanceFX
         path: |
           dist/VisualBoyAdvanceFX/
-
-    - name: Build GameCube
-      if: ${{ matrix.image == 'GameCube' }}
-      run: |
-        make -f Makefile.gc -j1
-
-    - name: Copy GameCube artifact
-      if: ${{ matrix.image == 'GameCube' }}
-      run: |
-        mkdir -p dist/VisualBoyAdvanceFX-GameCube
-        cp executables/vbafx-gc.dol dist/VisualBoyAdvanceFX-GameCube/
-
-    - name: Upload GameCube artifact
-      uses: actions/upload-artifact@v4
-      if: ${{ matrix.image == 'GameCube' }}
-      with:
-        name: VisualBoyAdvanceFX-GameCube
-        path: |
-          dist/VisualBoyAdvanceFX-GameCube/
 
